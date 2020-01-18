@@ -74,9 +74,13 @@ console.log(`Starting ${packageJson.name} v${packageJson.version}`);
 
 const startServer = (configPath, config) => {
   let publicUrl = opts.public_url;
+  if (publicUrl) {
+    console.log(`Using public URL '${publicUrl}'`);
+  }
   if (publicUrl && publicUrl.lastIndexOf('/') !== publicUrl.length - 1) {
     publicUrl += '/';
   }
+
   return require('./server')({
     configPath: configPath,
     config: config,
