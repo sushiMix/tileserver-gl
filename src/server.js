@@ -20,6 +20,9 @@ const packageJson = require('../package');
 const serve_font = require('./serve_font');
 const serve_style = require('./serve_style');
 const serve_data = require('./serve_data');
+
+const data_repo = require("./data_repository");
+
 const utils = require('./utils');
 
 let serve_rendered = null;
@@ -29,14 +32,13 @@ if (!isLight) {
   serve_rendered = require('./serve_rendered');
 }
 
-function start(opts) {
+async function start(opts) {
   console.log('Starting server');
 
   const app = express().disable('x-powered-by'),
     serving = {
       styles: {},
       rendered: {},
-      data: {},
       fonts: {}
     };
 
@@ -95,8 +97,12 @@ function start(opts) {
   if (options.dataDecorator) {
     try {
       options.dataDecoratorFunc = require(path.resolve(paths.root, options.dataDecorator));
-    } catch (e) {}
+    } catch (e) {
+      // do nothing
+    }
   }
+
+  await data_repo.init(config, opts.publicUrl);
 
   const data = clone(config.data || {});
 
@@ -104,7 +110,7 @@ function start(opts) {
     app.use(cors());
   }
 
-  app.use('/data/', serve_data.init(options, serving.data));
+  app.use('/data/', serve_data.init(options, data_repo.repo));
   app.use('/styles/', serve_style.init(options, serving.styles));
   if (serve_rendered) {
     startupPromises.push(
@@ -121,13 +127,13 @@ function start(opts) {
         success = serve_style.add(options, serving.styles, item, id, opts.publicUrl,
         (mbtiles, fromData) => {
           let dataItemId;
-          for (const id of Object.keys(data)) {
+          for (const id of Object.keys(data_repo.repo)) {
             if (fromData) {
               if (id === mbtiles) {
                 dataItemId = id;
               }
             } else {
-              if (data[id].mbtiles === mbtiles) {
+              if (data_repo.repo[id].mbtiles === mbtiles) {
                 dataItemId = id;
               }
             }
@@ -187,18 +193,6 @@ function start(opts) {
       app.use('/', sub);
     })
   );
-
-  for (const id of Object.keys(data)) {
-    const item = data[id];
-    if (!item.mbtiles || item.mbtiles.length === 0) {
-      console.log(`Missing "mbtiles" property for ${id}`);
-      continue;
-    }
-
-    startupPromises.push(
-      serve_data.add(options, serving.data, item, id, opts.publicUrl)
-    );
-  }
 
   if (options.serveAllStyles) {
     fs.readdir(options.paths.styles, {withFileTypes: true}, (err, files) => {
@@ -350,7 +344,7 @@ function start(opts) {
           `styles/${id}`, style.serving_rendered.tileJSON.format, opts.publicUrl)[0];
       }
     }
-    const data = clone(serving.data || {});
+    const data = clone(data_repo.repo || {});
     for (const id of Object.keys(data)) {
       const data_ = data[id];
       const tilejson = data[id].tileJSON;
@@ -425,7 +419,7 @@ function start(opts) {
 
   serveTemplate('/data/:id/$', 'data', req => {
     const id = req.params.id;
-    const data = clone(serving.data[id]);
+    const data = clone(data_repo.repo[id]);
     if (!data) {
       return null;
     }
@@ -466,30 +460,30 @@ function start(opts) {
 }
 
 module.exports = opts => {
-  const running = start(opts);
-
-  running.startupPromise.catch(err => {
-    console.error(err.message);
-    process.exit(1);
-  });
-
-  process.on('SIGINT', () => {
-    process.exit();
-  });
-
-  process.on('SIGHUP', () => {
-    console.log('Stopping server and reloading config');
-
-    running.server.shutdown(() => {
-      for (const key in require.cache) {
-        delete require.cache[key];
-      }
-
-      const restarted = start(opts);
-      running.server = restarted.server;
-      running.app = restarted.app;
+  start(opts).then((running) => {
+    running.startupPromise.catch(err => {
+      console.error(err.message);
+      process.exit(1);
     });
-  });
 
-  return running;
+    process.on('SIGINT', () => {
+      process.exit();
+    });
+  
+    process.on('SIGHUP', () => {
+      console.log('Stopping server and reloading config');
+  
+      running.server.shutdown(() => {
+        for (const key in require.cache) {
+          delete require.cache[key];
+        }
+  
+        const restarted = start(opts);
+        running.server = restarted.server;
+        running.app = restarted.app;
+      });
+    });
+  
+    return running;
+  });
 };

@@ -18,11 +18,55 @@ const Color = require('color');
 const express = require('express');
 const mercator = new (require('@mapbox/sphericalmercator'))();
 const mbgl = require('@mapbox/mapbox-gl-native');
-const MBTiles = require('@mapbox/mbtiles');
 const proj4 = require('proj4');
 const request = require('request');
 
+const data_repo = require("./data_repository");
+
 const utils = require('./utils');
+
+/**
+ * @typedef {Object} TileJSON ("sourceInfo")
+ * @description An other structure storing data about the source. Currently an update in-place of the Style JSON object.
+ * @property {string} type - "vector"
+ * @property {{Array.<string>}} tiles - An array of URL template. Normally only one value.
+ * @property {string} id
+ * @property {string} name
+ * @property {string} format
+ * @property {string} attribution
+ * @property {{Array.<number>}} bounds
+ * @property {{Array.<number>}} center
+ * @property {string} description
+ * @property {number} filesize
+ * @property {number} minzoom
+ * @property {number} maxzoom
+ * @property {string} masklevel
+ * @property {string} pixel_scale
+ * @property {string} planettime
+ * @property {{Array.<any>}} vector_layers
+ * @property {string} version
+ */
+
+/**
+ * @typedef {Object} InternalMap
+ * @description A map storing renderers and sources. One per style. Ideally there should be one per MBTiles file, not one per style.
+ * @property {{Array.<advancedPool.Pool>}} renderers - an array of renderer pools, one for each resolution supported (x1, x2, or x4)
+ * @property {Object.<string, MBTiles>} sources - a map indexing sources by their id (id in the style description, not the name of the 
+ * MBTiles file!). Sources are MBTiles object, to access the content of the .mbtiles files
+ */
+
+/**
+ * @typedef {Object} RenderedRepoInfo
+ * @description The type of objects stored in `serving.rendered`.
+ * @property {TileJSON} tileJSON - the TileJSON object returned for this source
+ * @property {string} publicUrl - enable exposing the server on subpaths, not necessarily the root of the domain
+ * @property {InternalMap} map - a map storing renderers and sources
+ * @property {Function} dataProjWGStoInternalWGS - coordinates conversion function
+ * @property {Date} lastModified - label of the building floor
+ * @property {string} [watermark] - optional string to be rendered into the raster tiles (and static maps) as watermark 
+ * (bottom-left corner). Can be used for hard-coding attributions etc. (can also be specified per-style). 
+ * Not used by default.
+ */
 
 const FLOAT_PATTERN = '[+-]?(?:\\d+|\\d+\.?\\d+)';
 const httpTester = /^(http(s)?:)?\/\//;
@@ -194,6 +238,118 @@ const calcZForBBox = (bbox, w, h, query) => {
   return z;
 };
 
+function parseStyleSources(styleJSON, params, repo, renderedRepoInfo) {
+  const queue = [];
+
+  const attributionOverride = params.tilejson && params.tilejson.attribution;
+
+  const getSourceId = (url) => {
+    if (!url || url.lastIndexOf('mbtiles:', 0) === -1) {
+      return null;
+    }
+
+    let mbtilesFile = url.substring('mbtiles://'.length);
+    const fromData = mbtilesFile[0] === '{' &&
+      mbtilesFile[mbtilesFile.length - 1] === '}';
+
+    if (fromData) {
+      mbtilesFile = mbtilesFile.substr(1, mbtilesFile.length - 2);
+      const mapsTo = (params.mapping || {})[mbtilesFile];
+      if (mapsTo) {
+        mbtilesFile = mapsTo;
+      }
+      if (!data_repo.repo[mbtilesFile]) {
+        console.error(`ERROR: data "${mbtilesFile}" not found!`);
+        process.exit(1);
+      }
+    }
+
+    return mbtilesFile;
+  };
+
+  let dataSourcePromise;
+  for (const name of Object.keys(styleJSON.sources)) {
+    let source = styleJSON.sources[name];
+    const url = source.url;
+
+    let mbtilesFile = getSourceId(url);
+    if (!mbtilesFile) {
+      continue;
+    }
+
+    // found mbtiles source, replace with info from local file
+    delete source.url;
+
+    // store the alias
+    repo.dataAliases[name] = mbtilesFile;
+
+    const repoSource = data_repo.repo[mbtilesFile];
+    const mbtWrapper = repoSource.mbtWrapper;
+
+    const updateRepoInfo = (repoInfo, mbtInfo) => {
+      if (!repoInfo.dataProjWGStoInternalWGS && mbtInfo.proj4) {
+        // how to do this for multiple sources with different proj4 defs?
+        const to3857 = proj4('EPSG:3857');
+        const toDataProj = proj4(mbtInfo.proj4 || "EPSG:3857");
+        repoInfo.dataProjWGStoInternalWGS = xy => to3857.inverse(toDataProj.forward(xy));
+      }
+
+      const type = source.type;
+      Object.assign(source, mbtInfo);
+      source.type = type;
+      source.tiles = [
+        // meta url which will be detected when requested
+        `mbtiles://${name}/{z}/{x}/{y}.${mbtInfo.format || 'pbf'}`
+      ];
+      delete source.scheme;
+
+      // if (options.dataDecoratorFunc) {
+      //   source = options.dataDecoratorFunc(name, 'tilejson', source);
+      // }
+
+      if (!attributionOverride &&
+        source.attribution && source.attribution.length > 0) {
+        if (repoInfo.tileJSON.attribution.length > 0) {
+          repoInfo.tileJSON.attribution += '; ';
+        }
+        repoInfo.tileJSON.attribution += source.attribution;
+      }
+    };
+
+    let info;
+    if (!mbtWrapper) {
+      // mbtWrapper is null for virtual sources
+      // assume projection is EPSG:3857 and format 'pbf
+      info = repoSource.tileJSON;
+      info.proj4 = "EPSG:3857";
+
+      updateRepoInfo(renderedRepoInfo, info);
+      dataSourcePromise = Promise.resolve();
+    } else {
+      let getInfoPromise = new Promise((resolve, reject) => {
+        mbtWrapper.getInfo((err, info) => {
+          if (err) {
+            reject(err);
+            return;
+          }
+
+          resolve(info);
+        });
+      });
+
+      dataSourcePromise = getInfoPromise.then((info) => {
+        updateRepoInfo(renderedRepoInfo, info);
+      });
+    }
+
+    repo.sources[name] = mbtWrapper;
+
+    queue.push(dataSourcePromise);
+  }
+
+  return queue;
+}
+
 const existingFonts = {};
 let maxScaleFactor = 2;
 
@@ -242,6 +398,7 @@ module.exports = {
         return res.status(400).send('Invalid size');
       }
       if (format === 'png' || format === 'webp') {
+        // nothing to do
       } else if (format === 'jpg' || format === 'jpeg') {
         format = 'jpeg';
       } else {
@@ -566,7 +723,8 @@ module.exports = {
   add: (options, repo, params, id, publicUrl, dataResolver) => {
     const map = {
       renderers: [],
-      sources: {}
+      sources: {},
+      dataAliases: {}
     };
 
     let styleJSON;
@@ -597,13 +755,26 @@ module.exports = {
               });
             } else if (protocol === 'mbtiles') {
               const parts = req.url.split('/');
-              const sourceId = parts[2];
-              const source = map.sources[sourceId];
-              const sourceInfo = styleJSON.sources[sourceId];
+              let sourceId = parts[2]; // the identifier of the source in the style, eg. 'openmaptiles'
               const z = parts[3] | 0,
                 x = parts[4] | 0,
                 y = parts[5].split('.')[0] | 0,
                 format = parts[5].split('.')[1];
+
+              // get data source ID
+              let aliasId = map.dataAliases[sourceId];
+
+              let concreteSourceId;
+              if (data_repo.repo[aliasId].isVirtual === true) {
+                const vsource = data_repo.repo[aliasId];
+                concreteSourceId = data_repo.getConcreteSourceId(vsource, x, y, z);
+              } else {
+                concreteSourceId = aliasId;
+              }
+
+              const source = data_repo.repo[concreteSourceId].mbtWrapper;
+              const sourceInfo = styleJSON.sources[sourceId];
+
               source.getTile(z, x, y, (err, data, headers) => {
                 if (err) {
                   if (options.verbose) console.log('MBTiles error, serving empty', err);
@@ -718,7 +889,7 @@ module.exports = {
       'format': 'png',
       'type': 'baselayer'
     };
-    const attributionOverride = params.tilejson && params.tilejson.attribution;
+
     Object.assign(tileJSON, params.tilejson || {});
     tileJSON.tiles = params.domains || options.domains;
     utils.fixTileJSONCenter(tileJSON);
@@ -732,78 +903,7 @@ module.exports = {
       watermark: params.watermark || options.watermark
     };
 
-    const queue = [];
-    for (const name of Object.keys(styleJSON.sources)) {
-      let source = styleJSON.sources[name];
-      const url = source.url;
-
-      if (url && url.lastIndexOf('mbtiles:', 0) === 0) {
-        // found mbtiles source, replace with info from local file
-        delete source.url;
-
-        let mbtilesFile = url.substring('mbtiles://'.length);
-        const fromData = mbtilesFile[0] === '{' &&
-          mbtilesFile[mbtilesFile.length - 1] === '}';
-
-        if (fromData) {
-          mbtilesFile = mbtilesFile.substr(1, mbtilesFile.length - 2);
-          const mapsTo = (params.mapping || {})[mbtilesFile];
-          if (mapsTo) {
-            mbtilesFile = mapsTo;
-          }
-          mbtilesFile = dataResolver(mbtilesFile);
-          if (!mbtilesFile) {
-            console.error(`ERROR: data "${mbtilesFile}" not found!`);
-            process.exit(1);
-          }
-        }
-
-        queue.push(new Promise((resolve, reject) => {
-          mbtilesFile = path.resolve(options.paths.mbtiles, mbtilesFile);
-          const mbtilesFileStats = fs.statSync(mbtilesFile);
-          if (!mbtilesFileStats.isFile() || mbtilesFileStats.size === 0) {
-            throw Error(`Not valid MBTiles file: ${mbtilesFile}`);
-          }
-          map.sources[name] = new MBTiles(mbtilesFile, err => {
-            map.sources[name].getInfo((err, info) => {
-              if (err) {
-                console.error(err);
-                return;
-              }
-
-              if (!repo[id].dataProjWGStoInternalWGS && info.proj4) {
-                // how to do this for multiple sources with different proj4 defs?
-                const to3857 = proj4('EPSG:3857');
-                const toDataProj = proj4(info.proj4);
-                repo[id].dataProjWGStoInternalWGS = xy => to3857.inverse(toDataProj.forward(xy));
-              }
-
-              const type = source.type;
-              Object.assign(source, info);
-              source.type = type;
-              source.tiles = [
-                // meta url which will be detected when requested
-                `mbtiles://${name}/{z}/{x}/{y}.${info.format || 'pbf'}`
-              ];
-              delete source.scheme;
-
-              if (options.dataDecoratorFunc) {
-                source = options.dataDecoratorFunc(name, 'tilejson', source);
-              }
-
-              if (!attributionOverride &&
-                source.attribution && source.attribution.length > 0) {
-                if (tileJSON.attribution.length > 0) {
-                  tileJSON.attribution += '; ';
-                }
-                tileJSON.attribution += source.attribution;
-              }
-              resolve();
-            });
-          });
-        }));
-      }
-    }
+    const queue = parseStyleSources(styleJSON, params, map, repo[id]);
 
     const renderersReadyPromise = Promise.all(queue).then(() => {
       // standard and @2x tiles are much more usual -> default to larger pools

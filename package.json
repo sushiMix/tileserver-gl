@@ -42,6 +42,8 @@
     "tileserver-gl-styles": "2.0.0"
   },
   "devDependencies": {
+    "eslint": "^7.11.0",
+    "eslint-config-google": "^0.14.0",
     "mocha": "^7.1.0",
     "should": "^13.2.3",
     "supertest": "^4.0.2"

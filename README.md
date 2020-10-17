@@ -43,6 +43,34 @@ This will download and start a ready to use container on your computer and the m
 
 On laptop you can use [Docker Kitematic](https://kitematic.com/) and search "tileserver-gl" and run it, then drop in the 'data' folder the MBTiles.
 
+## Running on local Linux instance
+Start by installing all dependency packages
+```bash
+sudo apt-get -y install \
+    apt-transport-https \
+    curl \
+    unzip \
+    build-essential \
+    python \
+    libcairo2-dev \
+    libgles2-mesa-dev \
+    libgbm-dev \
+    libllvm3.9 \
+    libprotobuf-dev \
+    libxxf86vm-dev \
+    xvfb \
+    x11-utils \
+    nodejs \
+    npm
+```
+
+Once this is node, install Node.js and NPM
+```bash
+sudo npm i --unsafe-perm=true --allow-root
+```
+
+To run the application
+
 ## Documentation
 
 You can read full documentation of this project at https://tileserver.readthedocs.io/.
